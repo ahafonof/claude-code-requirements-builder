@@ -1,1 +1,1 @@
-Follow protocol-engineering.md instructions
+Follow @.claude/protocol-engineering.md instructions

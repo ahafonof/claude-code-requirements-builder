@@ -22,9 +22,21 @@ var (
 	limiter            *RateLimiter
 	distributedLimiter *DistributedRateLimiter
 	useDistributed     bool
+	globalEventEmitter *EventEmitter
 )
 
 func init() {
+	initializeRateLimiter()
+}
+
+// initializeRateLimiter initializes the rate limiting system
+func initializeRateLimiter() {
+	// Initialize global event emitter
+	globalEventEmitter = &EventEmitter{
+		feed:        NewActivityFeed(1000),
+		broadcaster: NewSSEBroadcaster(),
+	}
+	
 	// Check if Redis URL is provided
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL != "" {
@@ -37,7 +49,7 @@ func init() {
 			RecoveryInterval: 10 * time.Second,
 		}
 		
-		drl, err := NewDistributedRateLimiter(cfg)
+		drl, err := NewDistributedRateLimiter(cfg, globalEventEmitter)
 		if err == nil {
 			distributedLimiter = drl
 			useDistributed = true
@@ -72,15 +84,19 @@ func RateLimitMiddleware(next http.Handler) http.Handler {
 
 		var allowed bool
 		if useDistributed && distributedLimiter != nil {
-			allowed = distributedLimiter.Allow(ip)
+			allowed = distributedLimiter.AllowWithRequest(ip, r)
 		} else {
 			allowed = limiter.allow(ip)
+			// Emit event for local rate limiter too
+			if !allowed && globalEventEmitter != nil {
+				globalEventEmitter.EmitRateLimitRejection(r)
+			}
 		}
 
 		if !allowed {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte(`{"error":"Rate limit exceeded. Maximum 100 requests per minute allowed."}`))
+			_, _ = w.Write([]byte(`{"error":"Rate limit exceeded. Maximum 100 requests per minute allowed."}`))
 			return
 		}
 
@@ -165,7 +181,11 @@ func getClientIP(r *http.Request) string {
 	}
 
 	// Fall back to RemoteAddr
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// If SplitHostPort fails, RemoteAddr might not have a port
+		return r.RemoteAddr
+	}
 	return ip
 }
 

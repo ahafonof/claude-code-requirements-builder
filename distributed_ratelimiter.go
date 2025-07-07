@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"time"
 	
@@ -59,10 +60,11 @@ type DistributedRateLimiter struct {
 	config          *Config
 	luaScript       *redis.Script
 	ctx             context.Context
+	eventEmitter    *EventEmitter
 }
 
 // NewDistributedRateLimiter creates a new distributed rate limiter
-func NewDistributedRateLimiter(cfg *Config) (*DistributedRateLimiter, error) {
+func NewDistributedRateLimiter(cfg *Config, eventEmitter *EventEmitter) (*DistributedRateLimiter, error) {
 	// Initialize Redis client
 	opt, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
@@ -75,6 +77,8 @@ func NewDistributedRateLimiter(cfg *Config) (*DistributedRateLimiter, error) {
 	// Test Redis connection
 	if err := redisClient.Ping(ctx).Err(); err != nil {
 		// Redis not available, but we'll continue with fallback
+		// Log the error for debugging purposes
+		_ = err
 	}
 	
 	// Create fallback limiter
@@ -129,6 +133,7 @@ func NewDistributedRateLimiter(cfg *Config) (*DistributedRateLimiter, error) {
 		config:          cfg,
 		luaScript:       luaScript,
 		ctx:             ctx,
+		eventEmitter:    eventEmitter,
 	}
 	
 	// Start recovery goroutine
@@ -152,13 +157,29 @@ func (drl *DistributedRateLimiter) Allow(ip string) bool {
 	// Try Redis operation
 	allowed, err := drl.redisAllow(ip)
 	if err != nil {
-		drl.circuitBreaker.RecordFailure()
+		drl.circuitBreaker.RecordFailure(drl.eventEmitter)
+		// Emit Redis failure event
+		if drl.eventEmitter != nil {
+			drl.eventEmitter.EmitRedisFailure("rate_limit_check", err)
+		}
 		return drl.fallbackAllow(ip)
 	}
 	
 	// Record success
 	drl.circuitBreaker.RecordSuccess()
 	drl.recordMetrics(allowed, time.Since(start), false)
+	
+	return allowed
+}
+
+// AllowWithRequest checks if request should be allowed and emits events
+func (drl *DistributedRateLimiter) AllowWithRequest(ip string, r *http.Request) bool {
+	allowed := drl.Allow(ip)
+	
+	// Emit rate limit rejection event if applicable
+	if !allowed && drl.eventEmitter != nil {
+		drl.eventEmitter.EmitRateLimitRejection(r)
+	}
 	
 	return allowed
 }
@@ -271,15 +292,25 @@ func (cb *CircuitBreaker) IsOpen() bool {
 }
 
 // RecordFailure records a Redis failure
-func (cb *CircuitBreaker) RecordFailure() {
+func (cb *CircuitBreaker) RecordFailure(eventEmitter *EventEmitter) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	
+	oldState := cb.state
 	cb.failures++
 	cb.lastFailureTime = time.Now()
 	
 	if cb.failures >= cb.failureThreshold {
 		cb.state = StateOpen
+		// Emit circuit breaker state change event
+		if eventEmitter != nil && oldState != StateOpen {
+			stateNames := map[CircuitState]string{
+				StateClosed:   "closed",
+				StateOpen:     "open",
+				StateHalfOpen: "half-open",
+			}
+			eventEmitter.EmitCircuitBreakerStateChange(stateNames[oldState], stateNames[StateOpen], cb.failures)
+		}
 	}
 }
 
